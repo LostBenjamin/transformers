@@ -685,7 +685,7 @@ class CodeGenForCausalLM(CodeGenPreTrainedModel):
         self.transformer.parallelize(self.device_map)
         self.first_device = self.transformer.first_device
         self.last_device = self.transformer.last_device
-        for name, m in self.model.named_children():
+        for name, m in self.named_children():
             if name != 'transformer':
                 setattr(self, name, m.to(self.first_device))
         self.lm_head = self.lm_head.to(self.first_device)
@@ -693,7 +693,7 @@ class CodeGenForCausalLM(CodeGenPreTrainedModel):
 
     def deparallelize(self):
         self.transformer.deparallelize()
-        for name, m in self.model.named_children():
+        for name, m in self.named_children():
             setattr(self, name, m.to("cpu"))
         self.model_parallel = False
         self.first_device = None
