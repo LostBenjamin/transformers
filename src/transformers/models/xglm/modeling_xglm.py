@@ -29,6 +29,7 @@ from ...modeling_outputs import BaseModelOutputWithPastAndCrossAttentions, Causa
 from ...modeling_utils import PreTrainedModel
 from ...utils import add_code_sample_docstrings, add_start_docstrings, add_start_docstrings_to_model_forward, logging
 from .configuration_xglm import XGLMConfig
+from ...utils.model_parallel_utils import assert_device_map, get_device_map
 
 
 logger = logging.get_logger(__name__)
@@ -562,9 +563,33 @@ class XGLMModel(XGLMPreTrainedModel):
         self.layers = nn.ModuleList([XGLMDecoderLayer(config) for _ in range(config.num_layers)])
         self.layer_norm = nn.LayerNorm(config.d_model)
 
+        # Model parallelism
+        self.model_parallel = False
+        self.device_map = None
+        self.first_device = None
+        self.last_device = None
+
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
+
+    def parallelize(self, device_map=None):
+        if device_map is None:
+            self.device_map = get_device_map(len(self.layers), range(torch.cuda.device_count()))
+        else:
+            self.device_map = device_map
+        assert_device_map(self.device_map, len(self.layers))
+        self.model_parallel = True
+        self.first_device = "cpu" if "cpu" in self.device_map.keys() else "cuda:" + str(min(self.device_map.keys()))
+        self.last_device = "cuda:" + str(max(self.device_map.keys()))
+
+        for k, v in self.device_map.items():
+            for layer in v:
+                cuda_device = "cuda:" + str(k)
+                self.layers[layer] = self.layers[layer].to(cuda_device)
+        self.embed_tokens = self.embed_tokens.to(self.first_device)
+        self.embed_positions = self.embed_positions.to(self.first_device)
+        self.layer_norm = self.layer_norm.to(self.last_device)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -740,6 +765,21 @@ class XGLMModel(XGLMPreTrainedModel):
 
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
+            if self.model_parallel:
+                device = hidden_states.device
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(device)
+                if encoder_hidden_states is not None:
+                    encoder_hidden_states = encoder_hidden_states.to(device)
+                if encoder_attention_mask is not None:
+                    encoder_attention_mask = encoder_attention_mask.to(device)
+                if head_mask is not None:
+                    head_mask[idx] = head_mask[idx].to(device)
+                if cross_attn_head_mask is not None:
+                    cross_attn_head_mask[idx] = cross_attn_head_mask[idx].to(device)
+                if past_key_value is not None:
+                    past_key_value = past_key_value.to(device)
+
             if self.gradient_checkpointing and self.training:
 
                 if use_cache:
@@ -792,6 +832,11 @@ class XGLMModel(XGLMPreTrainedModel):
                 if encoder_hidden_states is not None:
                     all_cross_attentions += (layer_outputs[2],)
 
+            if self.model_parallel:
+                for k, v in self.device_map.items():
+                    if idx == v[-1] and "cuda:" + str(k) != self.last_device:
+                        hidden_states = hidden_states.to("cuda:" + str(k + 1))
+
         hidden_states = self.layer_norm(hidden_states)
 
         # add hidden states from the last decoder layer
@@ -836,8 +881,28 @@ class XGLMForCausalLM(XGLMPreTrainedModel):
         self.model = XGLMModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        # Model parallelism
+        self.model_parallel = False
+        self.device_map = None
+        self.first_device = None
+        self.last_device = None
+
         # Initialize weights and apply final processing
         self.post_init()
+
+    def parallelize(self, device_map=None):
+        if device_map is None:
+            self.device_map = get_device_map(len(self.model.layers), range(torch.cuda.device_count()))
+        else:
+            self.device_map = device_map
+        assert_device_map(self.device_map, len(self.model.layers))
+        self.model.parallelize(self.device_map)
+        self.first_device = self.model.first_device
+        self.last_device = self.model.last_device
+        for name, m in self.named_children():
+            if name != 'model':
+                setattr(self, name, m.to(self.first_device))
+        self.model_parallel = True
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -903,7 +968,7 @@ class XGLMForCausalLM(XGLMPreTrainedModel):
             return_dict=return_dict,
         )
 
-        logits = self.lm_head(outputs[0])
+        logits = self.lm_head(outputs[0].to(self.first_device))
 
         loss = None
         if labels is not None:
